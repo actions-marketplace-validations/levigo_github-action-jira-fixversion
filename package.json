@@ -4,7 +4,8 @@
   "description": "Intended for CD, this action creates and sets the given version as fix version in Jira Cloud for given issues",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "ncc build index.js -o dist --license licenses.txt"
   },
   "repository": {
     "type": "git",
@@ -18,11 +19,12 @@
   },
   "homepage": "https://github.com/levigo/github-action-jira-fixversion#readme",
   "dependencies": {
-    "@actions/core": "^1.9.1",
-    "@actions/github": "^5.0.3",
-    "jira-client": "^8.1.0"
+    "@actions/core": "^1.11.1",
+    "@actions/github": "^5.1.1",
+    "jira-client": "^8.2.2"
   },
   "devDependencies": {
-    "@types/node": "^20.11.30"
+    "@types/node": "^24.12.4",
+    "@vercel/ncc": "^0.38.4"
   }
 }
