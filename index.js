@@ -1,110 +1,126 @@
-const core = require("@actions/core");
-const JiraApi = require("jira-client")
+/**
+ * Gleiche Action, aber mit jira.js v6 (Stand 05.08.2026 erst 1 Tag alt).
+ *
+ * Unterschiede zu v5:
+ *   - ESM-only, kein require() moeglich  -> action.yml: runs.using: node24
+ *   - Node >= 22 vorausgesetzt
+ *   - nur eine Transitive Dependency (zod), kein axios
+ *   - createCloudClient() statt new Version2Client(); nur REST API v3 = Jira Cloud
+ *   - updateVersion nimmt { id, body: {...} } statt flacher Felder
+ *   - Fehlerklassen: ApiError/AuthError/NotFoundError mit .status
+ *
+ * package.json:
+ *   "type": "module",
+ *   "dependencies": { "jira.js": "^6.1.0", "@actions/core": "^3.0.1" }
+ */
+import * as core from "@actions/core";
+import { createCloudClient, ApiError } from "jira.js";
 
-let jira, domain, username, password, versionName, versionDescription, versionArchived, issueKeys, versionReleased;
-(async () => {
-    try {
-        domain = core.getInput("domain");
-        username = core.getInput("username");
-        password = core.getInput("password");
-        versionName = core.getInput("versionName");
-        issueKeys = core.getInput("issueKeys");
-        versionDescription = core.getInput("versionDescription") || "CD Version";
-        versionArchived = core.getInput("versionArchived") === "true" || core.getInput("versionArchived") === true;
-        versionReleased = core.getInput("versionReleased") === "true" || core.getInput("versionReleased") === true;
-
-        // Initialize
-        jira = new JiraApi({
-            protocol: "https",
-            host: domain,
-            username: username,
-            password: password,
-        });
-        //core.setFailed(`version is not correct: [${version}] must be "1.0.0"/"v1.0.0"/"test 1.0.0" pattern`);
-        createAndSetVersion(issueKeys, versionName, versionDescription, versionArchived, versionReleased)
-
-        // core.setOutput("new-version", nextVersion);
-    } catch (error) {
-        core.setFailed(error.message);
-    }
-})();
-
-async function createAndSetVersion(issueKeys, versionName, versionDescription, versionArchived, versionReleased) {
-    // from e.g. TEST-1 get the project key --> TEST
-    const projectKey = getProjectKey(issueKeys);
-    const projectId = await getProjectId(projectKey);
-    const versionId = await createVersion(projectId, versionName, versionDescription);
-    const issueKeyArr = issueKeys.split(",");
-    for (let i = 0; i < issueKeyArr.length; i++) {
-        const issueKey = issueKeyArr[i];
-        const issueId = await getIssueId(issueKey);
-        await setVersion(issueId, versionId);
-    }
-    // archive version (passing it as argument while creating version doesn't work
-    if (versionArchived) {
-        await jira.updateVersion({
-            id: versionId,
-            archived: true,
-            projectId: projectId
-        });
-    }
-    // publish version (passing it as argument while creating version doesn't work
-    if (versionReleased) {
-        const date = new Date().toISOString().substring(0,10);
-        await jira.updateVersion({
-            id: versionId,
-            released: true,
-            projectId: projectId, 
-            releaseDate: date
-        });
-    }
-}
+const today = () => new Date().toISOString().slice(0, 10);
 
 function getProjectKey(issueKey) {
-    return issueKey.substring(0, issueKey.indexOf("-"));
-}
-
-async function getProjectId(projectKey) {
-    const project = await jira.getProject(projectKey);
-    return project.id
-}
-
-async function getIssueId(issueKey) {
-    const issue = await jira.findIssue(issueKey);
-    return issue.id;
-}
-
-async function createVersion(projectId, versionName, versionDescription) {
-    const date = new Date().toISOString().substring(0,10);
-    let version =  await jira.createVersion({
-        description: versionDescription,
-        name: versionName,
-        released: false,
-        startDate: date,
-        projectId: projectId
-    });
-    if (!!version.errors) {
-        // version exists already
-        version = await getVersion(projectId, versionName);
+    const projectKey = issueKey.split("-")[0];
+    if (!projectKey) {
+        throw new Error(`Project key nicht ermittelbar aus Issue key "${issueKey}"`);
     }
-    return version.id;
+    return projectKey;
 }
 
-async function getVersion(projectId, versionName) {
-    const versions = await jira.getVersions(projectId);
-    for (let i = 0; i < versions.length; i++) {
-        const version = versions[i];
-        if (version.name === versionName) {
-            return version;
-        }
+async function getProjectId(jira, projectKey) {
+    const project = await jira.projects.getProject({ projectIdOrKey: projectKey });
+    return Number(project.id);
+}
+
+async function findVersionByName(jira, projectId, versionName) {
+    const versions = await jira.projectVersions.getProjectVersions({
+        projectIdOrKey: String(projectId),
+    });
+    return versions.find(v => v.name === versionName);
+}
+
+async function createOrGetVersion(jira, projectId, versionName, versionDescription) {
+    try {
+        const version = await jira.projectVersions.createVersion({
+            name: versionName,
+            description: versionDescription,
+            projectId,
+            startDate: today(),
+            released: false,
+        });
+        return version.id;
+    } catch (error) {
+        // 400 = Version mit diesem Namen existiert im Projekt bereits
+        if (!(error instanceof ApiError) || error.status !== 400) throw error;
+
+        const existing = await findVersionByName(jira, projectId, versionName);
+        if (!existing) throw error;
+        core.info(`Version "${versionName}" existiert bereits (id ${existing.id})`);
+        return existing.id;
     }
-    return undefined;
 }
 
-async function setVersion(issueId, versionId) {
-    await jira.updateIssue(issueId, {
-        update: {
-            fixVersions: [{"add": {id: versionId}}]
-        }
+async function setFixVersion(jira, issueKey, versionId) {
+    await jira.issues.editIssue({
+        issueIdOrKey: issueKey,
+        update: { fixVersions: [{ add: { id: versionId } }] },
     });
 }
+
+async function createAndSetVersion(jira, opts) {
+    const issueKeyArr = opts.issueKeys.split(",").map(k => k.trim()).filter(Boolean);
+    if (issueKeyArr.length === 0) {
+        throw new Error('input "issueKeys" ist leer');
+    }
+
+    const projectId = await getProjectId(jira, getProjectKey(issueKeyArr[0]));
+    const versionId = await createOrGetVersion(
+      jira, projectId, opts.versionName, opts.versionDescription,
+    );
+
+    for (const issueKey of issueKeyArr) {
+        await setFixVersion(jira, issueKey, versionId);
+        core.info(`fixVersion ${opts.versionName} gesetzt auf ${issueKey}`);
+    }
+
+    // released/archived nicht beim Anlegen setzbar; erst freigeben, dann archivieren
+    if (opts.versionReleased) {
+        await jira.projectVersions.updateVersion({
+            id: versionId,
+            body: { projectId, released: true, releaseDate: today() },
+        });
+    }
+    if (opts.versionArchived) {
+        await jira.projectVersions.updateVersion({
+            id: versionId,
+            body: { projectId, archived: true },
+        });
+    }
+
+    return versionId;
+}
+
+async function main() {
+    const domain = core.getInput("domain", { required: true });
+    const jira = createCloudClient({
+        host: domain.startsWith("http") ? domain : `https://${domain}`,
+        auth: {
+            type: "basic",
+            email: core.getInput("username", { required: true }),
+            apiToken: core.getInput("password", { required: true }),
+        },
+    });
+
+    const versionId = await createAndSetVersion(jira, {
+        issueKeys: core.getInput("issueKeys", { required: true }),
+        versionName: core.getInput("versionName", { required: true }),
+        versionDescription: core.getInput("versionDescription") || "CD Version",
+        versionArchived: core.getInput("versionArchived").toLowerCase() === "true",
+        versionReleased: core.getInput("versionReleased").toLowerCase() === "true",
+    });
+
+    core.setOutput("version-id", versionId);
+}
+
+main().catch(error => {
+    core.setFailed(error instanceof Error ? error.message : String(error));
+});
